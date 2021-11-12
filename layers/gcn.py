@@ -5,11 +5,11 @@ import torch.nn as nn
 # Forked from https://github.com/PetarV-/DGI #
 ##############################################
 
-class GCNLayer(nn.Module):
+class GCN(nn.Module):
     
     def __init__(self, in_ft, out_ft, act='prelu', bias=True):
         
-        super(GCNLayer, self).__init__()
+        super(GCN, self).__init__()
         
         self.fc = nn.Linear(in_ft, out_ft, bias=False)
         self.act = nn.PReLU() if act == 'prelu' else nn.ReLU()

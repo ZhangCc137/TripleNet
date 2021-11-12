@@ -1,7 +1,10 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import copy
 import torch.nn.functional as F
+from layers.readout import AvgReadout
+from layers.discriminator import Discriminator
 
 
 class MLP(nn.Module):
@@ -67,18 +70,17 @@ def sim(h1, h2):
     return torch.mm(z1, z2.t())
 
 
-def contrastive_loss_wo_cross_network(h1, h2, z):
-    f = lambda x: torch.exp(x)
-    intra_sim = f(sim(h1, h1))
-    inter_sim = f(sim(h1, h2))
-    return -torch.log(inter_sim.diag() /
-                     (intra_sim.sum(dim=-1) + inter_sim.sum(dim=-1) - intra_sim.diag()))
+def consistency_loss(h1, h2):
+    x = F.normalize(h1, dim=-1, p=2)
+    y = F.normalize(h2, dim=-1, p=2)
+    return 2 - 2 * (x * y).sum(dim=-1)
 
 
-def contrastive_loss_wo_cross_view(h1, h2, z):
-    f = lambda x: torch.exp(x)
-    cross_sim = f(sim(h1, z))
-    return -torch.log(cross_sim.diag() / cross_sim.sum(dim=-1))
+def neg_pos_label(nodes_num):
+    x = torch.ones(1, nodes_num)
+    y = torch.zeros(1, nodes_num)
+    lbl = torch.cat((x, y), 1)
+    return lbl
 
 
 class MERIT(nn.Module):
@@ -103,6 +105,13 @@ class MERIT(nn.Module):
         self.target_ema_updater = EMA(moving_average_decay)
         self.negative_ema_updater = EMA(moving_average_decay)
         self.online_predictor = MLP(projection_size, prediction_size, prediction_hidden_size)
+
+        self.read = AvgReadout()
+        self.sigm = nn.Sigmoid()
+        self.disc = Discriminator(projection_size)
+
+        #self.bce = nn.BCEWithLogitsLoss()
+
         self.beta = beta
                    
     def reset_moving_average(self):
@@ -110,27 +119,34 @@ class MERIT(nn.Module):
         self.target_encoder = None
 
     def update_ma(self):
-        assert self.target_encoder is not None, 'target encoder has not been created yet'
+        assert self.target_encoder and self.negative_encoder is not None, 'target or negative encoder has not been created yet'
         update_moving_average(self.target_ema_updater, self.target_encoder, self.online_encoder)
+        update_moving_average(self.negative_ema_updater, self.negative_encoder, self.online_encoder)
 
-    def forward(self, aug_adj_1, aug_adj_2, aug_feat_1, aug_feat_2, sparse):
-        """online_proj_one = self.online_encoder(aug_adj_1, aug_feat_1, sparse)
-        online_proj_two = self.online_encoder(aug_adj_2, aug_feat_2, sparse)
+    def forward(self, aug_adj_1, aug_adj_2, aug_feat_1, aug_feat_2, adj, shuf_fts, sparse, msk = None, samp_bias1 = None, samp_bias2 = None):
 
-        online_pred_one = self.online_predictor(online_proj_one)
-        online_pred_two = self.online_predictor(online_proj_two)
+        online_proj = self.online_encoder(aug_adj_1, aug_feat_1, sparse)
+        online_pred = self.online_predictor(online_proj)
 
         with torch.no_grad():
-            target_proj_one = self.target_encoder(aug_adj_1, aug_feat_1, sparse)
-            target_proj_two = self.target_encoder(aug_adj_2, aug_feat_2, sparse)
+            target_proj = self.target_encoder(aug_adj_2, aug_feat_2, sparse)
+            negative_proj = self.negative_encoder(adj, shuf_fts, sparse)
 
-        l1 = self.beta * contrastive_loss_wo_cross_network(online_pred_one, online_pred_two, target_proj_two.detach()) + \
-            (1.0 - self.beta) * contrastive_loss_wo_cross_view(online_pred_one, online_pred_two, target_proj_two.detach())
 
-        l2 = self.beta * contrastive_loss_wo_cross_network(online_pred_two, online_pred_one, target_proj_one.detach()) + \
-            (1.0 - self.beta) * contrastive_loss_wo_cross_view(online_pred_two, online_pred_one, target_proj_one.detach())
+        l1 = consistency_loss(online_pred, target_proj)
 
-        loss = 0.5 * (l1 + l2)
+        online_pred_axis = online_pred[np.newaxis]
+        global_view = self.read(online_pred_axis, msk)
+        global_view = self.sigm(global_view)
 
-        return loss.mean()"""
+        negative_proj_axis = negative_proj[np.newaxis]
+        logits = self.disc(global_view, online_pred_axis, negative_proj_axis, samp_bias1, samp_bias2)
+        lbl = neg_pos_label(adj.shape[0])
+        #l2 = self.bce(logits, lbl)
+        loss = l1.mean()
+
+        return loss, logits, lbl
+
+
+
 

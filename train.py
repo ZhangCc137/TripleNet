@@ -9,10 +9,11 @@ import warnings
 warnings.filterwarnings("ignore")
 from utils import process
 from utils import aug
-from layers.gcn import GCNLayer
+from layers.gcn import GCN
 from models.merit import MERIT
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
+import torch.nn as nn
 
 
 def str_to_bool(value):
@@ -31,13 +32,13 @@ parser.add_argument('--device', type=str, default='cuda:0')
 parser.add_argument('--seed', type=int, default=2021)
 parser.add_argument('--data', type=str, default='citeseer')
 parser.add_argument('--runs', type=int, default=1)
-parser.add_argument('--eval_every', type=int, default=10)
-parser.add_argument('--epochs', type=int, default=500)
-parser.add_argument('--lr', type=float, default=3e-4)
-parser.add_argument('--weight_decay', type=float, default=0.0)
+parser.add_argument('--eval_every', type=int, default=1)
+parser.add_argument('--epochs', type=int, default=5000)
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--weight_decay', type=float, default=1e-6)
 parser.add_argument('--batch_size', type=int, default=4)
 parser.add_argument('--sample_size', type=int, default=2000)
-parser.add_argument('--patience', type=int, default=100)
+parser.add_argument('--patience', type=int, default=10000)
 parser.add_argument('--sparse', type=str_to_bool, default=True)
 
 parser.add_argument('--input_dim', type=int, default=3703)
@@ -56,10 +57,11 @@ parser.add_argument('--drop_feat2', type=float, default=0.4)
 args = parser.parse_args()
 torch.set_num_threads(4)
 
+BCE = nn.BCEWithLogitsLoss()
 
 def evaluation(adj, diff, feat, gnn, idx_train, idx_test, sparse):
     clf = LogisticRegression(random_state=0, max_iter=2000)
-    model = GCNLayer(input_size, gnn_output_size)  # 1-layer
+    model = GCN(input_size, gnn_output_size)  # 1-layer
     model.load_state_dict(gnn.state_dict())
     with torch.no_grad():
         embeds1 = model(feat, adj, sparse)
@@ -145,7 +147,7 @@ if __name__ == '__main__':
     result_over_runs = []
     
     # Initiate models
-    model = GCNLayer(input_size, gnn_output_size)
+    model = GCN(input_size, gnn_output_size)
     merit = MERIT(gnn=model,
                   feat_size=input_size,
                   projection_size=projection_size,
@@ -164,11 +166,15 @@ if __name__ == '__main__':
     for epoch in range(epochs):
         for _ in range(batch_size):
             idx = np.random.randint(0, adj.shape[-1] - sample_size + 1)
+            idx_per = np.random.permutation(np.arange(idx, idx + sample_size))
+            shuf_fts = features[:, idx_per, :]
             ba = adj[idx: idx + sample_size, idx: idx + sample_size]
             bd = diff[idx: idx + sample_size, idx: idx + sample_size]
             bd = sp.csr_matrix(np.matrix(bd))
-            features = features.squeeze(0)
-            bf = features[idx: idx + sample_size]
+            features_sq = features.squeeze(0)
+            bf = features_sq[idx: idx + sample_size]
+
+
 
             aug_adj1 = aug.aug_random_edge(ba, drop_percent=drop_edge_rate_1)
             aug_adj2 = bd
@@ -177,27 +183,35 @@ if __name__ == '__main__':
 
             aug_adj1 = process.normalize_adj(aug_adj1 + sp.eye(aug_adj1.shape[0]))
             aug_adj2 = process.normalize_adj(aug_adj2 + sp.eye(aug_adj2.shape[0]))
+            ba = process.normalize_adj(ba + sp.eye(ba.shape[0]))
 
             if sparse:
                 adj_1 = process.sparse_mx_to_torch_sparse_tensor(aug_adj1).to(device)
                 adj_2 = process.sparse_mx_to_torch_sparse_tensor(aug_adj2).to(device)
+                adj_ba = process.sparse_mx_to_torch_sparse_tensor(ba).to(device)
             else:
                 aug_adj1 = (aug_adj1 + sp.eye(aug_adj1.shape[0])).todense()
                 aug_adj2 = (aug_adj2 + sp.eye(aug_adj2.shape[0])).todense()
+                ba = (ba + sp.eye(ba.shape[0])).todense()
                 adj_1 = torch.FloatTensor(aug_adj1[np.newaxis]).to(device)
                 adj_2 = torch.FloatTensor(aug_adj2[np.newaxis]).to(device)
+                adj_ba = torch.FloatTensor(ba[np.newaxis]).to(device)
 
             aug_features1 = aug_features1.to(device)
             aug_features2 = aug_features2.to(device)
+            shuf_fts = shuf_fts.to(device)
 
             opt.zero_grad()
-            loss = merit(adj_1, adj_2, aug_features1, aug_features2, sparse)
+            l1, logits, lbl = merit(adj_1, adj_2, aug_features1, aug_features2, adj_ba, shuf_fts, sparse)
+            lbl = lbl.to(device)
+            l2 = BCE(logits, lbl)
+            loss = l1 + l2
             loss.backward()
             opt.step()
             merit.update_ma()
 
         if epoch % eval_every_epoch == 0:
-            acc = evaluation(eval_adj, eval_diff, features, model, idx_train, idx_test, sparse)
+            acc = evaluation(eval_adj, eval_diff, features_sq, model, idx_train, idx_test, sparse)
             if acc > best:
                 best = acc
                 patience_count = 0
